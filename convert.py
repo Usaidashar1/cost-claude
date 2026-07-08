@@ -45,7 +45,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from openpyxl import load_workbook, Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter  # noqa: F401 (kept for callers extending this module with formula-based sheets)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 log = logging.getLogger(__name__)
@@ -95,11 +95,30 @@ def tot_formula(c, formula, nfmt="#,##0.00"):
     c.border = BORDER
     c.number_format = nfmt
 
+def tot_static(c, value, nfmt="#,##0.00"):
+    """Write a plain computed number (not a formula) for totals. Formulas
+    only display their value once Excel has recalculated and cached it -
+    many viewers (LibreOffice quick-preview, Google Sheets before it loads,
+    grid/file previewers, or reading the file back with openpyxl/pandas
+    without opening it in Excel first) show a formula cell as blank until
+    that happens. A static value always displays correctly everywhere. It
+    still foots exactly, because it's computed as the sum of the SAME
+    rounded values already written into the rows above it."""
+    c.value = value
+    c.font = _f(bold=True)
+    c.fill = _fill("D9E1F2")
+    c.alignment = _al("right", "center")
+    c.border = BORDER
+    c.number_format = nfmt
+
 def widths(ws, d):
     for col, w in d.items(): ws.column_dimensions[col].width = w
 
 SVC_MAP = {
     "virtual machines": "Virtual Machines",
+    "virtual machine scale sets": "Virtual Machine Scale Sets",
+    "vm scale sets": "Virtual Machine Scale Sets",
+    "vmss": "Virtual Machine Scale Sets",
     "managed disks": "Managed Disks",
     "azure backup": "Azure Backup",
     "backup": "Azure Backup",
@@ -118,8 +137,14 @@ SVC_MAP = {
     "key vault": "Key Vault",
 }
 
+# Service-type "sheet" names that should be priced through the same VM
+# pricing/enrichment pipeline as "Virtual Machines" (same SKUs, same RI
+# economics - a scale set's underlying instances are billed and reserved
+# exactly like standalone VMs of the same size).
+VM_LIKE_SHEETS = {"Virtual Machines", "Virtual Machine Scale Sets"}
+
 SHEET_ORDER = [
-    "Virtual Machines", "Managed Disks", "Public IP Addresses",
+    "Virtual Machines", "Virtual Machine Scale Sets", "Managed Disks", "Public IP Addresses",
     "Load Balancer", "Application Gateway", "Azure Firewall", "VPN Gateway",
     "Storage Accounts", "Azure Backup", "SQL", "Bandwidth",
     "Azure Monitor", "Key Vault", "Others",
@@ -613,13 +638,17 @@ def write_res_header(ws):
     ws.row_dimensions[2].height = 28.8
     ws.freeze_panes = "A3"
 
-def write_vm_sheet(wb, rows, nfmt):
-    ws = wb.create_sheet("Virtual Machines")
+def write_vm_sheet(wb, rows, nfmt, sheet_name="Virtual Machines"):
+    ws = wb.create_sheet(sheet_name)
     write_res_header(ws)
     widths(ws, {"A": 15, "B": 15, "C": 14, "D": 12, "E": 55, "F": 13, "G": 14, "H": 14, "I": 55})
 
     ri = 3
-    payg_cells, ri1_cells, ri3_cells = [], [], []
+    payg_vals, ri1_vals, ri3_vals = [], [], []
+
+    def _emit(ri, vals, italic=False, color="000000"):
+        for ci, v in enumerate(vals, 1):
+            dat(ws.cell(ri, ci), v, italic=italic, color=color, align="right" if ci >= 6 and isinstance(v, float) else "left", nfmt=nfmt)
 
     for row in rows:
         p = row.get("api", {})
@@ -628,11 +657,9 @@ def write_vm_sheet(wb, rows, nfmt):
             ri1 = row.get("ri1", payg)
             ri3 = row.get("ri3", payg)
 
-            vals = [row["svc_cat"], row["svc_type"], row["cust_name"], row["region"], row["desc"],
-                    round(payg, 2), round(ri1, 2), round(ri3, 2), row.get("remarks", "")]
-            for ci, v in enumerate(vals, 1):
-                dat(ws.cell(ri, ci), v, align="right" if ci >= 6 and isinstance(v, float) else "left", nfmt=nfmt)
-            payg_cells.append(ri); ri1_cells.append(ri); ri3_cells.append(ri)
+            payg, ri1, ri3 = round(payg, 2), round(ri1, 2), round(ri3, 2)
+            _emit(ri, [row["svc_cat"], row["svc_type"], row["cust_name"], row["region"], row["desc"], payg, ri1, ri3, row.get("remarks", "")])
+            payg_vals.append(payg); ri1_vals.append(ri1); ri3_vals.append(ri3)
             ri += 1
             continue
 
@@ -650,82 +677,58 @@ def write_vm_sheet(wb, rows, nfmt):
                 "payg": sql_payg_deduced, "ri1": sql_payg_deduced, "ri3": sql_payg_deduced, "is_api": True
             })
 
-        sql_payg_total = sum(s["payg"] for s in sql_rows_b if s.get("payg"))
-        sql_ri1_total = sum(s.get("ri1") or s["payg"] for s in sql_rows_b)
-        sql_ri3_total = sum(s.get("ri3") or s["payg"] for s in sql_rows_b)
-
         compute_ri1 = p.get("compute_ri1", compute_payg)
         compute_ri3 = p.get("compute_ri3", compute_payg)
 
-        # Main VM row: compute cost only. License lines below are separate,
-        # visible line items rather than being merged in invisibly.
-        main_ri = ri
-        vals = [row["svc_cat"], row["svc_type"], row["cust_name"], row["region"], row["desc"],
-                round(compute_payg, 2), round(compute_ri1, 2), round(compute_ri3, 2), row.get("remarks", "")]
-        for ci, v in enumerate(vals, 1):
-            dat(ws.cell(ri, ci), v, align="right" if ci >= 6 and isinstance(v, float) else "left", nfmt=nfmt)
-        payg_cells.append(ri); ri1_cells.append(ri); ri3_cells.append(ri)
+        compute_payg, compute_ri1, compute_ri3 = round(compute_payg, 2), round(compute_ri1, 2), round(compute_ri3, 2)
+        _emit(ri, [row["svc_cat"], row["svc_type"], row["cust_name"], row["region"], row["desc"], compute_payg, compute_ri1, compute_ri3, row.get("remarks", "")])
+        payg_vals.append(compute_payg); ri1_vals.append(compute_ri1); ri3_vals.append(compute_ri3)
         ri += 1
 
         if win_lic_payg > 0:
-            sub = ["", "", "", "", "Windows License", round(win_lic_payg, 2), round(win_lic_payg, 2), round(win_lic_payg, 2), "License Cost (Not discounted by Compute RI)"]
-            for ci, v in enumerate(sub, 1):
-                dat(ws.cell(ri, ci), v, italic=True, color="595959", align="right" if ci >= 6 and isinstance(v, float) else "left", nfmt=nfmt)
-            payg_cells.append(ri); ri1_cells.append(ri); ri3_cells.append(ri)
+            v = round(win_lic_payg, 2)
+            _emit(ri, ["", "", "", "", "Windows License", v, v, v, "License Cost (Not discounted by Compute RI)"], italic=True, color="595959")
+            payg_vals.append(v); ri1_vals.append(v); ri3_vals.append(v)
             ri += 1
 
         if prem_os_payg > 0:
-            sub = ["", "", "", "", "Premium OS License (RHEL/SUSE)", round(prem_os_payg, 2), round(prem_os_payg, 2), round(prem_os_payg, 2), "License Cost (Not discounted by Compute RI)"]
-            for ci, v in enumerate(sub, 1):
-                dat(ws.cell(ri, ci), v, italic=True, color="595959", align="right" if ci >= 6 and isinstance(v, float) else "left", nfmt=nfmt)
-            payg_cells.append(ri); ri1_cells.append(ri); ri3_cells.append(ri)
+            v = round(prem_os_payg, 2)
+            _emit(ri, ["", "", "", "", "Premium OS License (RHEL/SUSE)", v, v, v, "License Cost (Not discounted by Compute RI)"], italic=True, color="595959")
+            payg_vals.append(v); ri1_vals.append(v); ri3_vals.append(v)
             ri += 1
 
         if other_payg > 0:
-            sub = ["", "", "", "", "Other/Unidentified Cost", round(other_payg, 2), round(other_payg, 2), round(other_payg, 2), "Please verify against source estimate"]
-            for ci, v in enumerate(sub, 1):
-                dat(ws.cell(ri, ci), v, italic=True, color="C00000", align="right" if ci >= 6 and isinstance(v, float) else "left", nfmt=nfmt)
-            payg_cells.append(ri); ri1_cells.append(ri); ri3_cells.append(ri)
+            v = round(other_payg, 2)
+            _emit(ri, ["", "", "", "", "Other/Unidentified Cost", v, v, v, "Please verify against source estimate"], italic=True, color="C00000")
+            payg_vals.append(v); ri1_vals.append(v); ri3_vals.append(v)
             ri += 1
 
         for s in sql_rows_b:
             rmk = "License Cost (Not discounted by Compute RI)" if s.get("is_api") else s.get("remarks", "")
-            sub = ["", "", "", "", s["desc"], round(s["payg"], 2) if s.get("payg") else None,
-                   round(s.get("ri1") or s["payg"], 2) if s.get("payg") else None,
-                   round(s.get("ri3") or s["payg"], 2) if s.get("payg") else None, rmk]
-            for ci, v in enumerate(sub, 1):
-                dat(ws.cell(ri, ci), v, italic=True, color="595959", align="right" if ci >= 6 and isinstance(v, float) else "left", nfmt=nfmt)
-            payg_cells.append(ri); ri1_cells.append(ri); ri3_cells.append(ri)
+            payg_v = round(s["payg"], 2) if s.get("payg") else None
+            ri1_v = round(s.get("ri1") or s["payg"], 2) if s.get("payg") else None
+            ri3_v = round(s.get("ri3") or s["payg"], 2) if s.get("payg") else None
+            _emit(ri, ["", "", "", "", s["desc"], payg_v, ri1_v, ri3_v, rmk], italic=True, color="595959")
+            payg_vals.append(payg_v or 0); ri1_vals.append(ri1_v or 0); ri3_vals.append(ri3_v or 0)
             ri += 1
 
         for s in [s for s in row.get("sub_rows", []) if "sql" not in s["desc"].lower()]:
-            sub = ["", "", "", "", s["desc"], round(s["payg"], 2) if s.get("payg") else None,
-                   round(s.get("ri1") or s["payg"], 2) if s.get("payg") else None,
-                   round(s.get("ri3") or s["payg"], 2) if s.get("payg") else None, s.get("remarks", "")]
-            for ci, v in enumerate(sub, 1):
-                dat(ws.cell(ri, ci), v, italic=True, color="595959", align="right" if ci >= 6 and isinstance(v, float) else "left", nfmt=nfmt)
-            payg_cells.append(ri); ri1_cells.append(ri); ri3_cells.append(ri)
+            payg_v = round(s["payg"], 2) if s.get("payg") else None
+            ri1_v = round(s.get("ri1") or s["payg"], 2) if s.get("payg") else None
+            ri3_v = round(s.get("ri3") or s["payg"], 2) if s.get("payg") else None
+            _emit(ri, ["", "", "", "", s["desc"], payg_v, ri1_v, ri3_v, s.get("remarks", "")], italic=True, color="595959")
+            payg_vals.append(payg_v or 0); ri1_vals.append(ri1_v or 0); ri3_vals.append(ri3_v or 0)
             ri += 1
 
     total_row = ri
+    total_payg, total_ri1, total_ri3 = round(sum(payg_vals), 2), round(sum(ri1_vals), 2), round(sum(ri3_vals), 2)
     ws.cell(total_row, 5, "Total").font = _f(bold=True)
     ws.cell(total_row, 5).border = BORDER
-    _write_sum_formula(ws, total_row, 6, payg_cells, nfmt)
-    _write_sum_formula(ws, total_row, 7, ri1_cells, nfmt)
-    _write_sum_formula(ws, total_row, 8, ri3_cells, nfmt)
+    tot_static(ws.cell(total_row, 6), total_payg, nfmt)
+    tot_static(ws.cell(total_row, 7), total_ri1, nfmt)
+    tot_static(ws.cell(total_row, 8), total_ri3, nfmt)
 
-    return f"F{total_row}", f"G{total_row}", f"H{total_row}"
-
-def _write_sum_formula(ws, total_row, col, row_indices, nfmt):
-    """Write a SUM formula over exactly the rows that were populated in this
-    column, so the total always foots to the displayed figures - even with
-    gaps from skipped sub-rows."""
-    col_letter = get_column_letter(col)
-    if not row_indices:
-        tot_formula(ws.cell(total_row, col), 0, nfmt)
-        return
-    refs = ",".join(f"{col_letter}{r}" for r in row_indices)
-    tot_formula(ws.cell(total_row, col), f"=SUM({refs})", nfmt)
+    return total_payg, total_ri1, total_ri3
 
 def write_generic_sheet(wb, sheet_name, rows, nfmt):
     ws = wb.create_sheet(sheet_name)
@@ -733,25 +736,27 @@ def write_generic_sheet(wb, sheet_name, rows, nfmt):
     widths(ws, {"A": 15, "B": 14, "C": 22, "D": 12, "E": 60, "F": 13, "G": 14, "H": 14, "I": 40})
 
     ri = 3
-    row_indices = []
+    payg_vals, ri1_vals, ri3_vals = [], [], []
     for row in rows:
-        payg = row.get("payg", 0)
-        ri1, ri3 = row.get("ri1", payg), row.get("ri3", payg)
+        payg = round(row.get("payg", 0), 2)
+        ri1 = round(row.get("ri1", payg), 2)
+        ri3 = round(row.get("ri3", payg), 2)
 
-        vals = [row["svc_cat"], row["svc_type"], row["cust_name"], row["region"], row["desc"], round(payg, 2), round(ri1, 2), round(ri3, 2), row.get("remarks", "")]
+        vals = [row["svc_cat"], row["svc_type"], row["cust_name"], row["region"], row["desc"], payg, ri1, ri3, row.get("remarks", "")]
         for ci, v in enumerate(vals, 1):
             dat(ws.cell(ri, ci), v, align="right" if ci >= 6 and isinstance(v, float) else "left", nfmt=nfmt)
-        row_indices.append(ri)
+        payg_vals.append(payg); ri1_vals.append(ri1); ri3_vals.append(ri3)
         ri += 1
 
     total_row = ri
+    total_payg, total_ri1, total_ri3 = round(sum(payg_vals), 2), round(sum(ri1_vals), 2), round(sum(ri3_vals), 2)
     ws.cell(total_row, 5, "Total").font = _f(bold=True)
     ws.cell(total_row, 5).border = BORDER
-    _write_sum_formula(ws, total_row, 6, row_indices, nfmt)
-    _write_sum_formula(ws, total_row, 7, row_indices, nfmt)
-    _write_sum_formula(ws, total_row, 8, row_indices, nfmt)
+    tot_static(ws.cell(total_row, 6), total_payg, nfmt)
+    tot_static(ws.cell(total_row, 7), total_ri1, nfmt)
+    tot_static(ws.cell(total_row, 8), total_ri3, nfmt)
 
-    return f"F{total_row}", f"G{total_row}", f"H{total_row}"
+    return total_payg, total_ri1, total_ri3
 
 def convert(input_path, output_path, currency="INR"):
     if currency not in CURRENCY_SYMBOLS:
@@ -763,19 +768,20 @@ def convert(input_path, output_path, currency="INR"):
     rows = parse_format(wb_in)
     buckets = classify(rows)
 
-    if "Virtual Machines" in buckets:
-        enrich_vms_concurrent(buckets["Virtual Machines"], currency)
+    for sname in VM_LIKE_SHEETS:
+        if sname in buckets:
+            enrich_vms_concurrent(buckets[sname], currency)
 
     wb_out = Workbook()
     wb_out.remove(wb_out.active)
-    total_cell_refs = {}  # sheet_name -> (payg_ref, ri1_ref, ri3_ref) as A1-style refs on that sheet
+    sheet_totals = {}  # sheet_name -> (payg_total, ri1_total, ri3_total) as plain numbers
 
     for sname in SHEET_ORDER:
         if sname not in buckets: continue
-        if sname == "Virtual Machines":
-            total_cell_refs[sname] = write_vm_sheet(wb_out, buckets[sname], nfmt)
+        if sname in VM_LIKE_SHEETS:
+            sheet_totals[sname] = write_vm_sheet(wb_out, buckets[sname], nfmt, sheet_name=sname)
         else:
-            total_cell_refs[sname] = write_generic_sheet(wb_out, sname, buckets[sname], nfmt)
+            sheet_totals[sname] = write_generic_sheet(wb_out, sname, buckets[sname], nfmt)
 
     ws = wb_out.create_sheet("Summary", 0)
     ws.merge_cells("A1:A2"); ws.merge_cells("B1:B2"); ws.merge_cells("C1:E1"); ws.merge_cells("F1:F2")
@@ -785,20 +791,20 @@ def convert(input_path, output_path, currency="INR"):
         c = ws[addr]; c.value = val; c.font = _f(bold=True); c.alignment = _al("center", "center"); c.border = BORDER
 
     ri = 3
-    summary_rows = []
-    for sl, (sname, (payg_ref, ri1_ref, ri3_ref)) in enumerate(total_cell_refs.items(), 1):
+    grand_payg = grand_ri1 = grand_ri3 = 0.0
+    for sl, (sname, (payg_total, ri1_total, ri3_total)) in enumerate(sheet_totals.items(), 1):
         c = ws.cell(ri, 1, sl); c.border = BORDER; c.alignment = _al("center")
         c = ws.cell(ri, 2, sname); c.border = BORDER
-        for ci, ref in [(3, payg_ref), (4, ri1_ref), (5, ri3_ref)]:
-            c = ws.cell(ri, ci, f"='{sname}'!{ref}")
+        for ci, val in [(3, payg_total), (4, ri1_total), (5, ri3_total)]:
+            c = ws.cell(ri, ci, val)
             c.alignment = _al("right"); c.border = BORDER; c.number_format = nfmt
         ws.cell(ri, 6).border = BORDER
-        summary_rows.append(ri)
+        grand_payg += payg_total; grand_ri1 += ri1_total; grand_ri3 += ri3_total
         ri += 1
 
-    _write_sum_formula(ws, ri, 3, summary_rows, nfmt)
-    _write_sum_formula(ws, ri, 4, summary_rows, nfmt)
-    _write_sum_formula(ws, ri, 5, summary_rows, nfmt)
+    tot_static(ws.cell(ri, 3), round(grand_payg, 2), nfmt)
+    tot_static(ws.cell(ri, 4), round(grand_ri1, 2), nfmt)
+    tot_static(ws.cell(ri, 5), round(grand_ri3, 2), nfmt)
     widths(ws, {"A": 5.5, "B": 22, "C": 14, "D": 14, "E": 14, "F": 55})
     ws.freeze_panes = "A3"
     wb_out.save(output_path)
