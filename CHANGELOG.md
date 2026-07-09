@@ -2,6 +2,24 @@
 
 This documents every fix applied against the production review. Run `pytest tests/test_convert.py -v` to see them all verified automatically.
 
+## Follow-up fixes (round 3) — RI pricing "missing" for D2_v3, B2s, F2s, F2s_v2, F4s, F4s_v2
+
+**Root cause found — this was not a code bug.** Microsoft retired new purchase/renewal of Azure Reserved VM Instances for a specific list of VM series effective **1 July 2026** (announced 6 May 2026: [Azure Reserved VM Instances for select VM series will no longer be available](https://techcommunity.microsoft.com/blog/azurecompute/azure-reserved-vm-instances-for-select-vm-series-will-no-longer-be-available-sta/4516505)):
+
+- 1-year RI retired for: `Av2, Amv2, Bv1, D, Ds, Dv2, Dsv2, F, Fs, Fsv2, G, Gs, Ls, Lsv2`
+- 1-year **and** 3-year RI retired for: `Dv3, Dsv3, Ev3, Esv3`
+
+Every SKU you flagged maps exactly onto this list: `D2_v3` → Dv3 (both terms gone), `B2s` → Bv1 (1yr gone), `F2s`/`F4s` → Fs (1yr gone), `F2s_v2`/`F4s_v2` → Fsv2 (1yr gone). I confirmed SKU extraction and region mapping are correct for all of these (not a parsing bug) — the Retail Prices API genuinely no longer returns Reservation entries for these series/terms. The Calculator UI showing "1 Year Available" is either not yet updated or shows a legacy/reference figure; it's no longer actually purchasable. If "D4s" refers to `D4s_v3`, that's `Dsv3` — also fully retired — which is the most likely explanation for the "wrong pricing" report too (RI silently mirroring PAYG). If it's a different generation or the *compute/PAYG* number itself looked wrong (not RI), that's a separate issue and I'll need the actual numbers to trace it.
+
+**Fix:** Added `_classify_vm_series()` and `_ri_retirement_note()`, which recognize SKUs in the retired list and attach a specific, accurate Remarks explanation ("Azure retired 1-year Reserved Instances for Fs-series as of 1 Jul 2026...") instead of silently showing RI == PAYG with no explanation. This turns an apparent tool bug into a clearly-surfaced, correctly-attributed platform change. See `tools/diagnose_sku.py` — a standalone script you can run from an environment with real network access to `prices.azure.com` to get ground-truth raw API data for any SKU (this sandbox can't reach that host, which is why this round required extra research rather than direct reproduction).
+
+## Follow-up fixes (round 2)
+
+| Issue | Fix |
+|---|---|
+| **VMSS bucketed into "Others", no RI pricing** | Added "Virtual machine scale sets" / "vm scale sets" / "vmss" to `SVC_MAP`, giving it its own "Virtual Machine Scale Sets" sheet. That sheet is now routed through the exact same pricing/enrichment pipeline as "Virtual Machines" (`VM_LIKE_SHEETS`), so VMSS rows get the same SKU parsing, live PAYG/RI pricing, and license breakdown. |
+| **Totals blank in every sheet + Summary sheet empty** | Root cause: totals had been switched to Excel `=SUM(...)` formulas. Formula cells only show a value once Excel actually recalculates and caches it — many viewers (LibreOffice quick-preview, Google Sheets before it fully loads, embedded grid previewers, or reading the file back with `openpyxl`/`pandas` without ever opening it in real Excel) display a formula cell as blank. Reverted every total (per-sheet and Summary) to a **plain static number**, computed as the exact sum of the same rounded values already written into the rows above it — so it always displays correctly everywhere, and still foots exactly (verified by `test_totals_are_static_values_and_foot_exactly`). |
+
 ## Critical
 
 | Issue | Fix |

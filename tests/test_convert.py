@@ -27,6 +27,7 @@ LINUX_HR = {
     "Standard_D4ds_v5": 0.230, "Standard_D4d_v5": 0.230,
     "Standard_M32ms_v2": 3.40,
     "Standard_D2s_v3": 0.096,
+    "Standard_D2_v3": 0.096,
 }
 WIN_DELTA_HR = 0.10
 RI1_DISCOUNT = 0.80
@@ -203,12 +204,104 @@ def test_unsupported_currency_raises_clear_error(tmp_path):
         C.convert(str(inp), str(out), "XYZ")
 
 
-# ── Medium: totals must always be real formulas that foot to the displayed rows ─
-def test_totals_are_formulas_not_static_numbers(tmp_path):
+# ── Totals must be reliable static values that foot exactly, in any viewer ──
+def test_totals_are_static_values_and_foot_exactly(tmp_path):
+    """
+    Totals were briefly implemented as Excel formulas (=SUM(...)), but those
+    only display a value once Excel has recalculated and cached it - many
+    viewers (including openpyxl/pandas reading the file back without ever
+    opening it in Excel) show a formula cell as blank. Totals must be plain
+    numbers that already equal the sum of the displayed rows.
+    """
     inp = tmp_path / "in.xlsx"
     out = tmp_path / "out.xlsx"
-    make_workbook(inp, [["Compute", "Virtual Machines", "x", "East US", "1 Standard_D4s_v3 (4 vCPU(s), 16 GB RAM)", 100.0, 90.0, 80.0]])
+    make_workbook(inp, [
+        ["Compute", "Virtual Machines", "a", "East US", "1 Standard_D4s_v3 (4 vCPU(s), 16 GB RAM)", 100.0, 90.0, 80.0],
+        ["Compute", "Virtual Machines", "b", "East US", "1 Standard_D2s_v3 (2 vCPU(s), 8 GB RAM)", 50.0, 45.0, 40.0],
+    ])
     C.convert(str(inp), str(out), "USD")
     ws = load_workbook(out)["Virtual Machines"]
     total_row = ws.max_row
-    assert str(ws.cell(total_row, 6).value).startswith("="), "PAYG total is a static number, not a formula"
+    total_payg = ws.cell(total_row, 6).value
+    assert isinstance(total_payg, (int, float)), f"Total is not a plain number (viewers that don't recalc formulas will show it blank): {total_payg!r}"
+
+    # Foot-check: sum of all displayed PAYG rows above the total must equal the total exactly.
+    displayed_sum = 0.0
+    for r in range(3, total_row):
+        v = ws.cell(r, 6).value
+        if isinstance(v, (int, float)):
+            displayed_sum += v
+    assert round(displayed_sum, 2) == round(total_payg, 2), f"Total ({total_payg}) does not foot to displayed rows ({displayed_sum})"
+
+
+def test_summary_sheet_totals_are_static_and_match_vm_sheet(tmp_path):
+    inp = tmp_path / "in.xlsx"
+    out = tmp_path / "out.xlsx"
+    make_workbook(inp, [
+        ["Compute", "Virtual Machines", "a", "East US", "1 Standard_D4s_v3 (4 vCPU(s), 16 GB RAM)", 100.0, 90.0, 80.0],
+    ])
+    C.convert(str(inp), str(out), "USD")
+    wb = load_workbook(out)
+    vm_ws = wb["Virtual Machines"]
+    vm_total = vm_ws.cell(vm_ws.max_row, 6).value
+    summary_ws = wb["Summary"]
+    summary_val = summary_ws.cell(3, 3).value
+    assert isinstance(summary_val, (int, float)), f"Summary sheet value is not a plain number: {summary_val!r}"
+    assert round(summary_val, 2) == round(vm_total, 2), "Summary sheet PAYG doesn't match the Virtual Machines sheet total"
+
+
+# ── VMSS must be priced through the same pipeline as VMs (own sheet + RI) ──
+def test_vmss_gets_its_own_sheet_with_ri_pricing(tmp_path):
+    inp = tmp_path / "in.xlsx"
+    out = tmp_path / "out.xlsx"
+    make_workbook(inp, [
+        ["Compute", "Virtual machine scale sets", "web-vmss", "East US",
+         "3 Standard_D4s_v3 (4 vCPU(s), 16 GB RAM)", 420.48, 400.0, 380.0],
+    ])
+    C.convert(str(inp), str(out), "USD")
+    wb = load_workbook(out)
+    assert "Virtual Machine Scale Sets" in wb.sheetnames, "VMSS was not given its own sheet"
+    assert "Others" not in wb.sheetnames or not any(
+        "vmss" in str(r[4]).lower() or "scale set" in str(r[1] or "").lower()
+        for r in wb["Others"].iter_rows(min_row=3, values_only=True) if r[1] or r[4]
+    ), "VMSS row leaked into the 'Others' sheet"
+    vmss_ws = wb["Virtual Machine Scale Sets"]
+    row = list(vmss_ws.iter_rows(min_row=3, max_row=3, values_only=True))[0]
+    ri1 = row[6]
+    payg = row[5]
+    assert ri1 != payg, "VMSS 1-Year RI price equals PAYG - RI pricing was not applied (same bug as plain VMs had)"
+    assert ri1 < payg, "VMSS RI price should be lower than PAYG"
+
+
+# ── RI retirement (Azure platform change, 1 Jul 2026) must be explained, not silent ──
+def test_retired_ri_series_gets_a_clear_remark_not_silent_payg_fallback(tmp_path, monkeypatch):
+    """
+    Standard_D2_v3 (Dv3 series) had BOTH 1yr and 3yr Reserved Instance
+    purchase/renewal retired by Azure on 2026-07-01. The live API legitimately
+    returns no Reservation entries for it any more - this must produce a
+    clear, specific remark rather than silently showing RI == PAYG with no
+    explanation (which looks like a tool bug).
+    """
+    def fake_api_no_ri(session, cache, filt, currency="INR"):
+        if "priceType eq 'Reservation'" in filt:
+            return []
+        return fake_api(session, cache, filt, currency)
+    monkeypatch.setattr(C, "_api", fake_api_no_ri)
+
+    inp = tmp_path / "in.xlsx"
+    out = tmp_path / "out.xlsx"
+    make_workbook(inp, [["Compute", "Virtual Machines", "d2v3-vm", "East US", "1 Standard_D2_v3 (2 vCPU(s), 8 GB RAM)", 100.0, 100.0, 100.0]])
+    C.convert(str(inp), str(out), "USD")
+    rows = vm_rows(out)
+    row = next(r for r in rows if r[2] == "d2v3-vm")
+    assert row[8] and "retired" in row[8].lower() and "2026" in row[8], f"expected a clear RI-retirement remark, got: {row[8]!r}"
+
+
+def test_vm_series_classifier_matches_known_retirement_lists():
+    cases = [
+        ("Standard_D2_v3", "Dv3"), ("Standard_B2s", "Bv1"), ("Standard_F2s", "Fs"),
+        ("Standard_F2s_v2", "Fsv2"), ("Standard_F4s", "Fs"), ("Standard_F4s_v2", "Fsv2"),
+        ("Standard_D4s_v3", "Dsv3"), ("Standard_D4s_v5", None),
+    ]
+    for sku, expected in cases:
+        assert C._classify_vm_series(sku) == expected, f"{sku}: expected {expected}, got {C._classify_vm_series(sku)}"
